@@ -15,10 +15,12 @@ This package is intended to be used with packages that leverage
 It is usable with ~icomplete~ (as well as ~fido-mode~), ~selectrum~,
 ~vertico~, ~corfu~, ~helm~ and ~company-mode~'s ~company-capf~.
 
-It is not currently usable with ~ivy~ or ~ido~ which don't yet support
-~completion-styles~ and have their own sorting and filtering systems.
-In addition to those packages, other ~company-mode~ backends will not hook
-into this package.
+It is not currently usable with ~ido~ which doesn't support
+~completion-styles~ and has its own sorting and filtering system.  In
+addition to those packages, other ~company-mode~ backends will not hook into
+this package.  ~ivy~ support can be somewhat baked in following
+https://github.com/jojojames/fussy#ivy-integration but the
+performance gains may not be as high as the other ~completion-read~ APIs.
 
 * Installation
 - Get the package, either from MELPA (soon to come):
@@ -306,6 +308,8 @@ Another option is to only apply fuzzy matching later in the query.
                '(basic partial-completion emacs22)
              '(fussy basic partial-completion emacs22))))
       (apply f args)))
+
+(advice-add 'company-capf :around 'company-capf-smart-completion-styles)
 #+end_src
 
 If you intend to run ~company-capf~ with ~fussy~, then use the below
@@ -335,6 +339,70 @@ setting ~helm-completion-style~ to ~emacs~ instead of ~helm~.
 
 For more information:
 https://github.com/emacs-helm/helm/blob/master/helm-mode.el#L269
+
+* Ivy Integration
+Since ~ivy~ doesn't support ~completion-styles~, we have to hack ~fussy~ into it.
+We can advise ~ivy--flx-sort~ and replace it with our own sorting function.
+
+#+begin_src emacs-lisp :tangle yes
+(defun ivy--fussy-sort (name cands)
+  "Sort according to closeness to string NAME the string list CANDS."
+  (condition-case nil
+      (let* ((bolp (= (string-to-char name) ?^))
+             ;; An optimized regex for fuzzy matching
+             ;; "abc" → "^[^a]*a[^b]*b[^c]*c"
+             (fuzzy-regex (concat "\\`"
+                                  (and bolp (regexp-quote (substring name 1 2)))
+                                  (mapconcat
+                                   (lambda (x)
+                                     (setq x (char-to-string x))
+                                     (concat "[^" x "]*" (regexp-quote x)))
+                                   (if bolp (substring name 2) name)
+                                   "")))
+             ;; Strip off the leading "^" for flx matching
+             (flx-name (if bolp (substring name 1) name))
+             cands-left
+             cands-to-sort)
+
+        ;; Filter out non-matching candidates
+        (dolist (cand cands)
+          (when (string-match-p fuzzy-regex cand)
+            (push cand cands-left)))
+
+        ;; pre-sort the candidates by length before partitioning
+        (setq cands-left (cl-sort cands-left #'< :key #'length))
+
+        ;; partition the candidates into sorted and unsorted groups
+        (dotimes (_ (min (length cands-left) ivy-flx-limit))
+          (push (pop cands-left) cands-to-sort))
+
+        (nconc
+         ;; Compute all of the flx scores in one pass and sort
+         (mapcar #'car
+                 (sort (mapcar
+                        (lambda (cand)
+                          (cons cand
+                                (car
+                                 (funcall
+                                  fussy-score-fn
+                                  cand flx-name
+                                  ivy--flx-cache))))
+                        cands-to-sort)
+                       (lambda (c1 c2)
+                         ;; Break ties by length
+                         (if (/= (cdr c1) (cdr c2))
+                             (> (cdr c1)
+                                (cdr c2))
+                           (< (length (car c1))
+                              (length (car c2)))))))
+         ;; Add the unsorted candidates
+         cands-left))
+    (error cands)))
+
+(advice-add 'ivy--flx-sort :override 'ivy--fussy-sort)
+#+end_src
+
+For more information: https://github.com/abo-abo/swiper/issues/848#issuecomment-1143129670
 
 * Recommendations
 

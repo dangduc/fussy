@@ -34,10 +34,12 @@
 ;; It is usable with `icomplete' (as well as `fido-mode'), `selectrum',
 ;; `vertico', `corfu', `helm' and `company-mode''s `company-capf'.
 
-;; It is not currently usable with `ivy' or `ido' which don't yet support
-;; `completion-styles' and have their own sorting and filtering systems.
-;; In addition to those packages, other `company-mode' backends will not hook
-;; into this package.
+;; It is not currently usable with `ido' which doesn't support
+;; `completion-styles' and has its own sorting and filtering system.  In
+;; addition to those packages, other `company-mode' backends will not hook into
+;; this package.  `ivy' support can be somewhat baked in following
+;; https://github.com/jojojames/fussy#ivy-integration but the
+;; performance gains may not be as high as the other `completion-read' APIs.
 
 ;; To use this style, prepend `fussy' to `completion-styles'.
 
@@ -56,6 +58,21 @@
 (eval-when-compile (require 'subr-x))
 
 ;;; Code:
+
+;;
+;; (@* "Landmarks" )
+;;
+
+;; `fussy-all-completions'
+;; `fussy--score'
+;; `fussy-filter-fast'
+
+;;
+;; (@* "Constants" )
+;;
+
+(defconst fussy--no-score '(0 0)
+  "Used for when `fussy-score-fn' returns nil.")
 
 ;;
 ;; (@* "Customizations" )
@@ -175,7 +192,9 @@ FN takes in the same arguments as `fussy-try-completions'.
 This FN should not be nil.
 
 Use either `fussy-filter-orderless' or `fussy-filter-fast' for faster
-filtering through the `all-completions' (written in C) interface."
+filtering through the `all-completions' (written in C) interface.
+
+If using `fussy-filter-fast', `fussy-fast-regex-fn' can be configured."
   :type `(choice
           (const :tag "Built in Flex Filtering"
                  ,#'fussy-filter-flex)
@@ -183,6 +202,29 @@ filtering through the `all-completions' (written in C) interface."
                  ,#'fussy-filter-fast)
           (const :tag "Orderless Filtering"
                  ,#'fussy-filter-orderless)
+          (function :tag "Custom function"))
+  :group 'fussy)
+
+(defcustom fussy-fast-regex-fn
+  #'fussy-pattern-flex-2
+  "Function used to create regex for `fussy-filter-fast'.
+
+It takes in a STR and returns a regex usable with `all-completions'.
+
+The return value of this FN is meant to be pushed to `completion-regexp-list'.
+
+Flex 1 is what is used in `company-flx'.  It seems to be the fastest from an eye
+test but all the regex are comparable in performance.
+
+Flex 2 functions match the regex returned by `orderless-flex'.  Flex 2 functions
+are more exhaustive than Flex 1 functions."
+  :type `(choice
+          (const :tag "Flex 1"
+                 ,#'fussy-pattern-flex-1)
+          (const :tag "Flex 2"
+                 ,#'fussy-pattern-flex-2)
+          (const :tag "Flex 2 in RX"
+                 ,#'fussy-pattern-flex-rx)
           (function :tag "Custom function"))
   :group 'fussy)
 
@@ -234,6 +276,38 @@ Scoring functions in this list's highlighting are then taken care of by either
 
 Functions in this list should match `fussy-score-fn'."
   :type 'list
+  :group 'fussy)
+
+(defcustom fussy-remove-bad-char-fn
+  #'fussy-without-tofu-char
+  "Function used to strip characters that some backends are unable to handle.
+
+Some scoring backends \(e.g. Rust backends\) are unable to handle strings with
+certain character encoding.  This function is applied to the candidate strings
+before they are passed to the scoring function.
+
+This was added specifically for `consult' but other encodings could also pose
+a problem.  To keep the performance of the Rust backends useful,
+`fussy-without-tofu-char' is set as the default function.
+`fussy-without-tofu-char' is an order of magnitude faster than
+`fussy-without-unencodeable-chars' but won't handle every case.
+
+Another option is to use `fussy-encode-coding-string' which dumbly converts
+a multibytestring without considering what the final string will look like.
+Using this may work for the purpose of matching too as the final candidate
+string may go from something like abcX to abcR where X was the multibyte char
+that is not useable with the above scoring backends and R is a random ascii
+character encoded from X.
+
+For more information: \(https://github.com/minad/consult/issues/585\)"
+  :type `(choice
+          (const :tag "Remove Tofu"
+                 ,#'fussy-without-tofu-char)
+          (const :tag "Remove All"
+                 ,#'fussy-without-unencodeable-chars)
+          (const :tag "Convert to Unibyte"
+                 ,#'fussy-encode-coding-string)
+          (function :tag "Custom function"))
   :group 'fussy)
 
 ;;;###autoload
@@ -296,25 +370,38 @@ Implement `all-completions' interface with additional fuzzy / `flx' scoring."
       (while-no-input
         (pcase-let*
             ((metadata (completion-metadata string table pred))
-             (using-pcm-highlight (fussy--using-pcm-highlight-p table))
              (cache (if (memq (completion-metadata-get metadata 'category)
                               '(file
                                 project-file))
                         flx-file-cache
                       flx-strings-cache))
+             ;; `default-directory' -> ~/.emacs.d
+             ;; If user type in "abc".
+             ;; `find-file' ->
+             ;; string: ~/.emacs.d/abc prefix: ~/.emacs.d/ infix: abc
+             ;; `project-find-file' ->
+             ;; string: abc prefix:  infix: abc
+             ;; Conclusion: Use infix for scoring.
+             (beforepoint (substring string 0 point))
+             (afterpoint (substring string point))
+             (bounds (completion-boundaries beforepoint table pred afterpoint))
+             (infix (concat
+                     (substring beforepoint (car bounds))
+                     (substring afterpoint 0 (cdr bounds))))
              (`(,all ,pattern ,prefix)
               (funcall fussy-filter-fn
                        string table pred point)))
+          ;; (message (format "string: %s prefix: %s infix: %s"
+          ;;                  string prefix infix))
           (when all
             (nconc
-             (if (or (> (length string) fussy-max-query-length)
-                     (string= string ""))
-                 (fussy--maybe-highlight pattern all :always-highlight)
+             (if (or (> (length infix) fussy-max-query-length)
+                     (string= infix ""))
+                 (fussy--pcm-highlight pattern all)
                (if (< (length all) fussy-max-candidate-limit)
                    (fussy--maybe-highlight
                     pattern
-                    (fussy--score all string using-pcm-highlight cache)
-                    using-pcm-highlight)
+                    (fussy--score all infix cache))
                  (let ((unscored-candidates '())
                        (candidates-to-score '()))
                    ;; Pre-sort the candidates by length before partitioning.
@@ -335,8 +422,7 @@ Implement `all-completions' interface with additional fuzzy / `flx' scoring."
                      pattern
                      (fussy--score
                       (reverse candidates-to-score)
-                      string using-pcm-highlight cache)
-                     using-pcm-highlight)
+                      infix cache))
                     ;; Add the unsorted candidates.
                     ;; We could highlight these too,
                     ;; (e.g. with `fussy--maybe-highlight') but these are
@@ -351,8 +437,8 @@ Implement `all-completions' interface with additional fuzzy / `flx' scoring."
 ;; (@* "Scoring & Highlighting" )
 ;;
 
-(defun fussy--score (candidates string using-pcm-highlight cache)
-  "Score and propertize \(if not USING-PCM-HIGHLIGHT\) CANDIDATES using STRING.
+(defun fussy--score (candidates string cache)
+  "Score and propertize CANDIDATES using STRING.
 
 Use CACHE for scoring."
   (mapcar
@@ -363,9 +449,14 @@ Use CACHE for scoring."
        (put-text-property 0 1 'completion-score 0 x))
       (:default
        (let ((score
-              (funcall fussy-score-fn
-                       x string
-                       cache)))
+              (or
+               (funcall fussy-score-fn
+                        x string
+                        cache)
+               fussy--no-score)))
+         ;; (message
+         ;;  (format "candidate: %s string: %s score %s" x string (car score)))
+
          ;; This is later used by `completion--adjust-metadata' for sorting.
          (put-text-property 0 1 'completion-score
                             (car score)
@@ -373,16 +464,16 @@ Use CACHE for scoring."
          ;; If we're using pcm highlight, we don't need to propertize the
          ;; string here. This is faster than the pcm highlight but doesn't
          ;; seem to work with `find-file'.
-         (when (fussy--should-propertize-p using-pcm-highlight)
+         (when (fussy--should-propertize-p)
            (setq
             x (funcall fussy-propertize-fn x score))))))
      x)
    candidates))
 
-(defun fussy--should-propertize-p (using-pcm-highlight)
+(defun fussy--should-propertize-p ()
   "Whether or not to call `fussy-propertize-fn'.
 
-If USING-PCM-HIGHLIGHT is t, highlighting will be handled in
+If `fussy--using-pcm-highlight-p' is t, highlighting will be handled in
 `fussy--maybe-highlight'.
 
 If `fussy--orderless-p' is t, `fussy-filter-orderless' will take care of
@@ -390,22 +481,24 @@ highlighting.
 
 If `fussy-propertize-fn' is nil, no highlighting should take place."
   (and
-   (not using-pcm-highlight)
+   (not (fussy--using-pcm-highlight-p))
    (not (fussy--orderless-p))
    fussy-propertize-fn))
 
-(defun fussy--maybe-highlight (pattern collection using-pcm-highlight)
-  "Highlight COLLECTION using PATTERN if USING-PCM-HIGHLIGHT is true."
-  (if using-pcm-highlight
-      ;; This seems to be the best way to get highlighting to work consistently
-      ;; with `find-file'.
-      (completion-pcm--hilit-commonality pattern collection)
-    ;; This will be the case when the `completing-read' function is not
-    ;; `find-file'.
-    ;; Assume that the collection has already been highlighted.
-    ;; e.g. When `using-pcm-highlight' is nil or we're using `orderless' for
-    ;; filtering and highlighting.
+(defun fussy--maybe-highlight (pattern collection)
+  "Highlight COLLECTION using PATTERN.
+
+Only highlight if `fussy--using-pcm-highlight-p' is t."
+  (if (fussy--using-pcm-highlight-p)
+      (fussy--pcm-highlight pattern collection)
+    ;; Assume that the collection's highlighting is handled elsewhere.
     collection))
+
+(defun fussy--pcm-highlight (pattern collection)
+  "Highlight with pcm-style for COLLECTION using PATTERN.
+
+pcm-style refers to using `completion-pcm--hilit-commonality' for highlighting."
+  (completion-pcm--hilit-commonality pattern collection))
 
 (defun fussy--propertize-common-part (obj score)
   "Return propertized copy of OBJ according to score.
@@ -480,6 +573,8 @@ SCORE of nil means to clear the properties."
    (lambda (c1 c2)
      (let ((s1 (or (get-text-property 0 'completion-score c1) 0))
            (s2 (or (get-text-property 0 'completion-score c2) 0)))
+       ;; (message (format "c1: %s score: %d" c1 s1))
+       ;; (message (format "c2: %s score: %d" c2 s2))
        (if (and (= s1 s2)
                 fussy-compare-same-score-fn)
            (funcall fussy-compare-same-score-fn c1 c2)
@@ -533,30 +628,54 @@ Check C1 and C2 in `minibuffer-history-variable'."
   "Return whether or not we're using `orderless' for filtering."
   (eq fussy-filter-fn 'fussy-filter-orderless))
 
-(defun fussy--using-pcm-highlight-p (table)
+(defun fussy--using-pcm-highlight-p ()
   "Check if highlighting should use `completion-pcm--hilit-commonality'.
 
 Check if TABLE needs to be specially highlighted.
 Check if `fussy-score-fn' used doesn't return match indices.
 Check if `orderless' is being used."
   (and
-   (or
-    ;; This table seems peculiar in that highlighting seems to get wiped...
-    (eq table 'completion-file-name-table)
-    ;; These don't generate match indices to highlight at all so we should
-    ;; highlight with `completion-pcm--hilit-commonality'.
-    (memq fussy-score-fn fussy-score-fns-without-indices))
+   ;; These don't generate match indices to highlight at all so we should
+   ;; highlight with `completion-pcm--hilit-commonality'.
+   (memq fussy-score-fn fussy-score-fns-without-indices)
    ;; If we're using `orderless' to filter, don't use pcm highlights because
    ;; `orderless' does it on its own.
    (not (fussy--orderless-p))))
 
-(defun fussy--string-without-unencodeable-chars (string)
-  "Strip invalid chars from STRING."
+(defun fussy-without-unencodeable-chars (string)
+  "Strip invalid chars from STRING.
+
+See `fussy-remove-bad-char-fn'."
   ;; https://emacs.stackexchange.com/questions/5732/how-to-strip-invalid-utf-8-characters-from-a-string
   (string-join
    (delq nil (mapcar (lambda (ch)
                        (encode-coding-char ch 'utf-8 'unicode))
                      string))))
+
+(defconst fussy--consult--tofu-char #x200000
+  "Special character used to encode line prefixes for disambiguation.
+We use invalid characters outside the Unicode range.")
+
+(defconst fussy--consult--tofu-range #x100000
+  "Special character range.")
+
+(defsubst fussy--consult--tofu-p (char)
+  "Return non-nil if CHAR is a tofu."
+  (<= fussy--consult--tofu-char char
+      (+ fussy--consult--tofu-char fussy--consult--tofu-range -1)))
+
+(defun fussy-without-tofu-char (string)
+  "Strip unencodeable char from STRING.
+
+See `fussy-remove-bad-char-fn'."
+  (if (fussy--consult--tofu-p (aref string (- (length string) 1)))
+      (substring string 0 (- (length string) 1))
+    string))
+
+(defun fussy-encode-coding-string (string)
+  "Call `encode-coding-string' for STRING."
+  (encode-coding-string string 'utf-8 t))
+
 ;;
 ;; (@* "Filtering" )
 ;;
@@ -619,13 +738,8 @@ that's written in C for faster filtering."
          (infix (concat
                  (substring beforepoint (car bounds))
                  (substring afterpoint 0 (cdr bounds))))
-         (regexp (concat "\\`"
-                         (mapconcat
-                          (lambda (x)
-                            (setq x (string x))
-                            (concat "[^" x "]*" (regexp-quote x)))
-                          infix
-                          "")))
+         (regexp
+          (funcall fussy-fast-regex-fn infix))
          (completion-regexp-list (cons regexp completion-regexp-list))
          ;; Commentary on why we prefer prefix over infix.
          ;; For `find-file', if the prefix exists, we're in a different
@@ -660,7 +774,7 @@ that's written in C for faster filtering."
          ;; using `completion-pcm--hilit-commonality' so skip evaluating the
          ;; pattern if this is not the pcm highlight case.
          (pattern
-          (when (fussy--using-pcm-highlight-p table)
+          (when (fussy--using-pcm-highlight-p)
             ;; Note to self:
             ;; The way we create the pattern here can be found in
             ;; `completion-substring--all-completions'.
@@ -676,6 +790,59 @@ that's written in C for faster filtering."
     ;;                    prefix infix regexp pattern))
     ;;   (princ completions))
     (list completions pattern prefix)))
+
+;;
+;; (@* "Pattern Compiler" )
+;;
+;; Random note:
+;; These return something similar to what `orderless-pattern-compiler'
+;; would return if they were wrapped inside a list.
+;; e.g. \(list \(fussy-pattern-flex-1 "str"\)\)
+;;
+
+(defun fussy-pattern-flex-1 (str)
+  "Make STR flex pattern.
+
+This may be the fastest regex to use but is not exhaustive."
+  (concat "\\`"
+          (mapconcat
+           (lambda (x)
+             (setq x (string x))
+             (concat "[^" x "]*" (regexp-quote x)))
+           str
+           "")))
+
+(defun fussy-pattern-flex-2 (str)
+  "Make STR flex pattern.
+
+This is a copy of the `orderless-flex' pattern written without `rx'.
+
+This one may be slower than `fussy-pattern-flex-1' but is more
+exhaustive on matches."
+  (concat
+   (when (> (length str) 1)
+     "\\(?:")
+   (mapconcat
+    (lambda (x)
+      (format "\\(%c\\)" x))
+    str
+    ".*")
+   (when (> (length str) 1)
+     "\\)")))
+
+(defun fussy-pattern-flex-rx (str)
+  "Make STR flex pattern using `rx'.
+
+This is a copy of the `orderless-flex' pattern."
+  (require 'rx)
+  (rx-to-string
+   `(seq
+     ""
+     ,@(cl-loop
+        for (sexp . more) on (cl-loop for char across str collect char)
+        collect `(group ,sexp)
+        when more collect '(zero-or-more nonl))
+     "")))
 
 ;;
 ;; (@* "Integration with other Packages" )
@@ -706,8 +873,10 @@ skim or clangd algorithm can be used.
 If `orderless' is used for filtering, we skip calculating matches
 for more speed."
   (require 'fuz)
-  (let ((str (fussy--string-without-unencodeable-chars str))
-        (query (fussy--string-without-unencodeable-chars query)))
+  (let ((str (funcall fussy-remove-bad-char-fn str))
+        (query
+         ;; Assume query can just be passed in as a unibyte string.
+         (fussy-encode-coding-string query)))
     (if fussy-fuz-use-skim-p
         (if (eq fussy-filter-fn 'fussy-filter-orderless)
             (when (fboundp 'fuz-calc-score-skim)
@@ -734,10 +903,12 @@ skim or clangd algorithm can be used.
 If `orderless' is used for filtering, we skip calculating matches
 for more speed."
   (require 'fuz-bin)
-  (let ((str
-         (fussy--string-without-unencodeable-chars str))
+  ;; (message (format "before: str: %s query: %s" str query))
+  (let ((str (funcall fussy-remove-bad-char-fn str))
         (query
-         (fussy--string-without-unencodeable-chars query)))
+         ;; Assume query can just be passed in as a unibyte string.
+         (fussy-encode-coding-string query)))
+    ;; (message (format "after: str: %s query: %s" str query))
     (if fussy-fuz-use-skim-p
         (if (eq fussy-filter-fn 'fussy-filter-orderless)
             (when (fboundp 'fuz-bin-dyn-score-skim)
@@ -770,9 +941,10 @@ highlighting."
   (require 'sublime-fuzzy)
   (when (fboundp 'sublime-fuzzy-score)
     (let ((str
-           (fussy--string-without-unencodeable-chars str))
+           (funcall fussy-remove-bad-char-fn str))
           (query
-           (fussy--string-without-unencodeable-chars query)))
+           ;; Assume query can just be passed in as a unibyte string.
+           (fussy-encode-coding-string query)))
       (list (sublime-fuzzy-score query str)))))
 
 ;; `hotfuzz' integration

@@ -1,8 +1,19 @@
+;;; fussy-test.el --- `fussy' test. -*- lexical-binding: t; -*-
 (require 'ert)
 (require 'fussy)
 
 ;; For `help--symbol-completion-table'.
 (require 'help-fns)
+
+(defconst fussy--consult--tofu-char #x200000
+  "Special character used to encode line prefixes for disambiguation.
+We use invalid characters outside the Unicode range.
+
+This is a copy of `consult--tofu-char' that we've copied over here so that we
+can strip out this character for `consult' specific functions that encode
+the character into the candidate.
+
+See `fussy-without-tofu-char'.")
 
 (defvar fussy-history-variable '())
 
@@ -31,60 +42,60 @@
              (car (benchmark-run 1
                     (fussy-histlen< "xyz" "abc"))))))
 
-(ert-deftest fussy-all-completions-fussy-filter-fn-flex-c< ()
-  "Assert `fussy-filter-flex-c' is the fastest filter method."
+(ert-deftest fussy-all-completions-fussy-filter-fn-fast< ()
+  "Assert `fussy-filter-fast' is the fastest filter method."
   (dolist (query '("a" "b" "c"))
     (let* ((table 'help--symbol-completion-table)
            (pred nil)
            (point 1)
-           (fussy-filter-fn 'fussy-filter-flex-c)
-           (flex-c-res
+           (fussy-filter-fn 'fussy-filter-fast)
+           (fast-res
             (car
              (benchmark-run 3
                (fussy-all-completions query table pred point)))))
       (should
-       (< flex-c-res
+       (< fast-res
           (let ((fussy-filter-fn 'fussy-filter-flex))
             (car (benchmark-run 3
                    (fussy-all-completions query table pred point))))))
       (should
-       (< flex-c-res
+       (< fast-res
           (let ((fussy-filter-fn 'fussy-filter-orderless))
             (car (benchmark-run 3
                    (fussy-all-completions query table pred point)))))))))
 
-(ert-deftest fussy-filter-fn-flex-c< ()
-  "Assert `fussy-filter-flex-c' is the fastest filter method."
+(ert-deftest fussy-filter-fn-fast< ()
+  "Assert `fussy-filter-fast' is the fastest filter method."
   (dolist (query '("a" "b" "c" "def"))
     (let* ((table 'help--symbol-completion-table)
            (pred nil)
            (point 1)
-           (flex-c-res
+           (fast-res
             (car (benchmark-run 3
-                   (fussy-filter-flex-c query table pred point)))))
+                   (fussy-filter-fast query table pred point)))))
       (should
        (<
-        flex-c-res
+        fast-res
         (car (benchmark-run 3
                (fussy-filter-orderless query table pred point)))))
       (should
        (<
-        flex-c-res
+        fast-res
         (car (benchmark-run 3
                (fussy-filter-flex query table pred point))))))))
 
-(ert-deftest fussy-filter-fn-flex-c-candidates ()
-  "Assert result of `fussy-filter-flex-c' matches other filters."
+(ert-deftest fussy-filter-fn-fast-candidates ()
+  "Assert result of `fussy-filter-fast' matches other filters."
   (dolist (query '("a" "b" "c" "def"))
     (let* ((table 'help--symbol-completion-table)
            (pred nil)
            (point 1)
-           (flex-c-res (fussy-filter-flex-c query table pred point)))
+           (fast-res (fussy-filter-fast query table pred point)))
       (should
-       (= (length flex-c-res)
+       (= (length fast-res)
           (length (fussy-filter-flex query table pred point))))
       (should
-       (= (length flex-c-res)
+       (= (length fast-res)
           (length (fussy-filter-orderless query table pred point)))))))
 
 (ert-deftest fussy-histlen<-test ()
@@ -130,11 +141,9 @@
         '("~/.emacs.d/straight/repos/orderless/orderless.el"
           "~/Code/yyoshereios/iOSTest/yyosHereiPadRootViewController.h"))
        (string-cache-res
-        (fussy--score candidates "odor" nil
-                      flx-strings-cache))
+        (fussy--score candidates "odor" flx-strings-cache))
        (file-cache-res
-        (fussy--score candidates "odor" nil
-                      flx-file-cache)))
+        (fussy--score candidates "odor" flx-file-cache)))
 
     ;; With `flx-strings-cache' candidate 1 loses to candidate 2 which is
     ;; not desirable for filenames.
@@ -149,78 +158,206 @@
      (> (get-text-property 0 'completion-score (nth 0 file-cache-res))
         (get-text-property 0 'completion-score (nth 1 file-cache-res))))))
 
-(ert-deftest fussy--string-without-unencodeable-chars-test ()
+(ert-deftest fussy-without-unencodeable-chars-test ()
   "Test that unencodeable chars are removed."
   (should
    (string=
-    (fussy--string-without-unencodeable-chars
+    (fussy-without-unencodeable-chars
      (string-as-multibyte  ";; Copyright 2022 Jo Beøˆ€’"))
     ";; Copyright 2022 Jo Be"))
   (should
    (string=
-    (fussy--string-without-unencodeable-chars
+    (fussy-without-unencodeable-chars
      (string-as-multibyte
       ";; This buffer is for text that is not saved, and for Lisp evaluation.øˆ€€"))
     ";; This buffer is for text that is not saved, and for Lisp evaluation.")))
 
-(ert-deftest fussy--string-without-unencodeable-chars-consult--tofu-char-test ()
+(ert-deftest fussy-without-unencodeable-chars-consult--tofu-char-test ()
   "Test that `consult--tofu-char' is removed."
-  (let ((tofu (char-to-string #x200000)))
+  (should
+   (string=
+    (fussy-without-unencodeable-chars (concat "jjbb" (char-to-string #x200000)))
+    "jjbb")))
+
+(ert-deftest fussy-without-tofu-char-test ()
+  "Test `fussy-without-tofu-char'."
+  (should
+   (string=
+    (fussy-without-tofu-char (string-make-multibyte "Makefile"))
+    "Makefile"))
+  (should
+   (string=
+    (fussy-without-tofu-char
+     (concat "jjbb" (char-to-string fussy--consult--tofu-char)))
+    "jjbb"))
+  (should
+   (string=
+    (fussy-without-tofu-char
+     (string-as-multibyte  ";; Copyright 2022 Jo Beøˆ€’"))
+    ";; Copyright 2022 Jo Be"))
+  (should
+   (string=
+    (fussy-without-tofu-char
+     (string-as-multibyte
+      ";; This buffer is for text that is not saved, and for Lisp evaluation.øˆ€€"))
+    ";; This buffer is for text that is not saved, and for Lisp evaluation.")))
+
+(ert-deftest fussy-without-tofu-char-good-input-test ()
+  "Test `fussy-without-tofu-char'."
+  (should
+   (string=
+    (fussy-without-tofu-char "bb") "bb"))
+  (should
+   (string=
+    (fussy-without-tofu-char "jj") "jj")))
+
+(ert-deftest fussy-without-tofu-char-perf-test ()
+  "Test `fussy-without-tofu-char' performance.
+
+This test asserts `fussy-without-tofu-char' is much much faster than
+`fussy-without-unencodeable-chars'."
+  (let* ((tofu (char-to-string fussy--consult--tofu-char))
+         (string-1 (concat "jjbb" tofu))
+         (string-2 (string-as-multibyte ";; Copyright 2022 Jo Beøˆ€’"))
+         (string-3 (string-as-multibyte ";; This buffer is for text that is not saved, and for Lisp evaluation.øˆ€€"))
+         (performance-factor 200))
     (should
-     (string=
-      (fussy--string-without-unencodeable-chars (concat "jjbb" tofu))
-      "jjbb"))))
+     (<
+      (* performance-factor
+         (car (benchmark-run 1000 (fussy-without-tofu-char string-1))))
+      (car (benchmark-run 1000 (fussy-without-unencodeable-chars string-1)))))
+    (should
+     (<
+      (* performance-factor
+         (car (benchmark-run 1000 (fussy-without-tofu-char string-2))))
+      (car (benchmark-run 1000 (fussy-without-unencodeable-chars string-2)))))
+    (should
+     (<
+      (* performance-factor
+         (car (benchmark-run 1000 (fussy-without-tofu-char string-3))))
+      (car (benchmark-run 1000 (fussy-without-unencodeable-chars string-3)))))))
+
+(ert-deftest fussy-encode-coding-string-test ()
+  "Test `fussy-encode-coding-string'."
+  (should
+   (string=
+    (fussy-encode-coding-string
+     (concat "jjbb" (char-to-string fussy--consult--tofu-char)))
+    "jjbb\370\210\200\200\200"))
+  (should
+   (string=
+    (fussy-encode-coding-string
+     (string-as-multibyte  ";; Copyright 2022 Jo Beøˆ€’"))
+    ";; Copyright 2022 Jo Be\370\210\200\201\222"))
+  (should
+   (string=
+    (fussy-encode-coding-string
+     (string-as-multibyte
+      ";; This buffer is for text that is not saved, and for Lisp evaluation.øˆ€€"))
+    ";; This buffer is for text that is not saved, and for Lisp evaluation.\370\210\200\200\201")))
+
+(ert-deftest fussy-encode-coding-string-good-input-test ()
+  "Test `fussy-encode-coding-string'."
+  (should
+   (string=
+    (fussy-encode-coding-string "bb") "bb"))
+  (should
+   (string=
+    (fussy-encode-coding-string "jj") "jj")))
+
+(ert-deftest fussy-encode-coding-string-perf-test ()
+  "Test `fussy-encode-coding-string' performance.
+
+This test asserts `fussy-encode-coding-string' is much much faster than
+`fussy-without-unencodeable-chars'."
+  (let* ((tofu (char-to-string fussy--consult--tofu-char))
+         (string-1 (concat "jjbb" tofu))
+         (string-2 (string-as-multibyte ";; Copyright 2022 Jo Beøˆ€’"))
+         (string-3 (string-as-multibyte ";; This buffer is for text that is not saved, and for Lisp evaluation.øˆ€€"))
+         (performance-factor 100))
+    (should
+     (<
+      (* performance-factor
+         (car (benchmark-run 1000 (fussy-encode-coding-string string-1))))
+      (car (benchmark-run 1000 (fussy-without-unencodeable-chars string-1)))))
+    (should
+     (<
+      (* performance-factor
+         (car (benchmark-run 1000 (fussy-encode-coding-string string-2))))
+      (car (benchmark-run 1000 (fussy-without-unencodeable-chars string-2)))))
+    (should
+     (<
+      (* performance-factor
+         (car (benchmark-run 1000 (fussy-encode-coding-string string-3))))
+      (car (benchmark-run 1000 (fussy-without-unencodeable-chars string-3)))))))
 
 (ert-deftest fussy--should-propertize-p ()
   "Test `fussy--should-propertize-p' return correct values."
   ;; use-pcm-highlight is t.
-  (let ((use-pcm-highlight t)
-        (fussy-filter-fn 'not-orderless)
-        (fussy-propertize-fn 'something))
+  (cl-letf* (((symbol-function 'fussy--using-pcm-highlight-p)
+              (lambda () t))
+             (fussy-filter-fn 'not-orderless)
+             (fussy-propertize-fn 'something))
     (should
-     (eq (fussy--should-propertize-p use-pcm-highlight) nil)))
+     (eq (fussy--should-propertize-p) nil)))
 
   ;; `fussy-fitler-fn' is `orderless'.
-  (let ((use-pcm-highlight nil)
-        (fussy-filter-fn 'fussy-filter-orderless)
-        (fussy-propertize-fn 'something))
+  (cl-letf* (((symbol-function 'fussy--using-pcm-highlight-p)
+              (lambda () nil))
+             (fussy-filter-fn 'fussy-filter-orderless)
+             (fussy-propertize-fn 'something))
     (should
-     (eq (fussy--should-propertize-p use-pcm-highlight) nil)))
+     (eq (fussy--should-propertize-p) nil)))
 
   ;; `fussy-propertize-fn' is nil.
-  (let ((use-pcm-highlight nil)
-        (fussy-filter-fn 'not-orderless)
-        (fussy-propertize-fn nil))
+  (cl-letf* (((symbol-function 'fussy--using-pcm-highlight-p)
+              (lambda () nil))
+             (fussy-filter-fn 'not-orderless)
+             (fussy-propertize-fn nil))
     (should
-     (eq (fussy--should-propertize-p use-pcm-highlight) nil)))
+     (eq (fussy--should-propertize-p) nil)))
 
   ;; Should return something.
-  (let ((use-pcm-highlight nil)
-        (fussy-filter-fn 'not-orderless)
-        (fussy-propertize-fn 'something))
+  (cl-letf* (((symbol-function 'fussy--using-pcm-highlight-p)
+              (lambda () nil))
+             (fussy-filter-fn 'not-orderless)
+             (fussy-propertize-fn 'something))
     (should
-     (fussy--should-propertize-p use-pcm-highlight))))
+     (fussy--should-propertize-p))))
 
 (ert-deftest fussy--using-pcm-highlight-p ()
   "Test `fussy--using-pcm-highlight-p' return correct values."
-  ;; table is `completion-file-name-table'.
-  (let ((table 'completion-file-name-table)
-        (fussy-filter-fn 'not-orderless))
-    (should
-     (fussy--using-pcm-highlight-p table)))
-
   ;; `fussy-score-fn' returns no indices.
-  (let ((table 'random-table)
-        (fussy-score-fn 'fn-without-indices)
+  (let ((fussy-score-fn 'fn-without-indices)
         (fussy-score-fns-without-indices '(fn-without-indices))
         (fussy-filter-fn 'not-orderless))
     (should
-     (fussy--using-pcm-highlight-p table)))
+     (fussy--using-pcm-highlight-p)))
 
   ;; `fussy-filter-fn' is using `orderless'.
-  (let ((table 'completion-file-name-table)
-        (fussy-score-fn 'fn-without-indices)
+  (let ((fussy-score-fn 'fn-without-indices)
         (fussy-score-fns-without-indices '(fn-without-indices))
         (fussy-filter-fn 'fussy-filter-orderless))
     (should
-     (eq (fussy--using-pcm-highlight-p table) nil))))
+     (eq (fussy--using-pcm-highlight-p) nil))))
+
+(ert-deftest fussy-pattern-flex-2-test ()
+  "Test flex-2 matches flex-rx and `orderless-flex'."
+  (should
+   (string= (fussy-pattern-flex-2 "a")
+            (fussy-pattern-flex-rx "a")))
+  (should
+   (string= (fussy-pattern-flex-2 "abc")
+            (fussy-pattern-flex-rx "abc")))
+  (should
+   (string= (fussy-pattern-flex-2 "abasd90803423c")
+            (fussy-pattern-flex-rx "abasd90803423c")))
+  (should
+   (string= (fussy-pattern-flex-2 "a")
+            (orderless-flex "a")))
+  (should
+   (string= (fussy-pattern-flex-2 "abc")
+            (orderless-flex "abc")))
+  (should
+   (string= (fussy-pattern-flex-2 "abasd90803423c")
+            (orderless-flex "abasd90803423c"))))
